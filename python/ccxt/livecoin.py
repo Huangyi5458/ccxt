@@ -4,17 +4,26 @@
 # https://github.com/ccxt/ccxt/blob/master/CONTRIBUTING.md#how-to-contribute-code
 
 from ccxt.base.exchange import Exchange
+
+# -----------------------------------------------------------------------------
+
+try:
+    basestring  # Python 3
+except NameError:
+    basestring = str  # Python 2
 import hashlib
 import math
 from ccxt.base.errors import ExchangeError
 from ccxt.base.errors import AuthenticationError
 from ccxt.base.errors import ArgumentsRequired
+from ccxt.base.errors import BadResponse
 from ccxt.base.errors import InsufficientFunds
 from ccxt.base.errors import InvalidOrder
 from ccxt.base.errors import OrderNotFound
 from ccxt.base.errors import NotSupported
-from ccxt.base.errors import DDoSProtection
+from ccxt.base.errors import RateLimitExceeded
 from ccxt.base.errors import ExchangeNotAvailable
+from ccxt.base.errors import OnMaintenance
 from ccxt.base.decimal_to_precision import TRUNCATE
 from ccxt.base.decimal_to_precision import DECIMAL_PLACES
 
@@ -29,18 +38,25 @@ class livecoin(Exchange):
             'rateLimit': 1000,
             'userAgent': self.userAgents['chrome'],
             'has': {
+                'cancelOrder': True,
+                'CORS': False,
+                'createOrder': True,
+                'fetchBalance': True,
+                'fetchClosedOrders': True,
+                'fetchCurrencies': True,
                 'fetchDepositAddress': True,
                 'fetchDeposits': True,
-                'CORS': False,
+                'fetchMarkets': True,
+                'fetchMyTrades': True,
+                'fetchOpenOrders': True,
+                'fetchOrder': True,
+                'fetchOrderBook': True,
+                'fetchOrders': True,
+                'fetchTicker': True,
                 'fetchTickers': True,
-                'fetchCurrencies': True,
+                'fetchTrades': True,
                 'fetchTradingFee': True,
                 'fetchTradingFees': True,
-                'fetchOrders': True,
-                'fetchOrder': True,
-                'fetchOpenOrders': True,
-                'fetchClosedOrders': True,
-                'fetchMyTrades': True,
                 'fetchWithdrawals': True,
                 'withdraw': True,
             },
@@ -105,15 +121,21 @@ class livecoin(Exchange):
             'commonCurrencies': {
                 'BTCH': 'Bithash',
                 'CPC': 'Capricoin',
+                'CBC': 'CryptoBossCoin',  # conflict with CBC(CashBet Coin)
+                'CPT': 'Cryptos',  # conflict with CPT = Contents Protocol https://github.com/ccxt/ccxt/issues/4920 and https://github.com/ccxt/ccxt/issues/6081
                 'EDR': 'E-Dinar Coin',  # conflicts with EDR for Endor Protocol and EDRCoin
                 'eETT': 'EETT',
                 'FirstBlood': '1ST',
                 'FORTYTWO': '42',
                 'LEO': 'LeoCoin',
+                'MIOTA': 'IOTA',  # https://github.com/ccxt/ccxt/issues/7487
                 'ORE': 'Orectic',
+                'PLN': 'Plutaneum',  # conflict with Polish Zloty
                 'RUR': 'RUB',
                 'SCT': 'SpaceCoin',
                 'TPI': 'ThaneCoin',
+                'UNUS': 'LEO',  # https://github.com/ccxt/ccxt/issues/7496
+                'WAX': 'WAXP',
                 'wETT': 'WETT',
                 'XBT': 'Bricktox',
             },
@@ -134,7 +156,7 @@ class livecoin(Exchange):
                     '30': AuthenticationError,
                     '31': NotSupported,
                     '32': ExchangeError,
-                    '429': DDoSProtection,
+                    '429': RateLimitExceeded,
                     '503': ExchangeNotAvailable,
                 },
                 'broad': {
@@ -193,6 +215,11 @@ class livecoin(Exchange):
 
     def fetch_currencies(self, params={}):
         response = self.publicGetInfoCoinInfo(params)
+        if isinstance(response, basestring):
+            if response.find('site is under maintenance') >= 0:
+                raise OnMaintenance(self.id + ' fetchCurrencies() failed to fetch the currencies, the exchange is on maintenance')
+            else:
+                raise BadResponse(self.id + ' fetchCurrencies() failed to fetch the currencies')
         currencies = self.safe_value(response, 'info')
         result = {}
         for i in range(0, len(currencies)):
@@ -258,6 +285,9 @@ class livecoin(Exchange):
                     'max': math.pow(10, precision),
                 },
             },
+            'id': None,
+            'code': None,
+            'name': None,
         }
         currencies = [
             {'id': 'USD', 'code': 'USD', 'name': 'US Dollar'},
@@ -361,11 +391,11 @@ class livecoin(Exchange):
         result = {}
         for i in range(0, len(ids)):
             id = ids[i]
-            market = self.markets_by_id[id]
+            market = self.safe_market(id)
             symbol = market['symbol']
             ticker = tickers[id]
             result[symbol] = self.parse_ticker(ticker, market)
-        return result
+        return self.filter_by_array(result, 'symbol', symbols)
 
     def fetch_ticker(self, symbol, params={}):
         self.load_markets()
@@ -418,9 +448,8 @@ class livecoin(Exchange):
         if amount is not None:
             if price is not None:
                 cost = amount * price
-        symbol = None
-        if market is not None:
-            symbol = market['symbol']
+        marketId = self.safe_string(trade, 'symbol')
+        symbol = self.safe_symbol(marketId, market, '/')
         return {
             'id': id,
             'info': trade,
@@ -438,15 +467,16 @@ class livecoin(Exchange):
         }
 
     def fetch_my_trades(self, symbol=None, since=None, limit=None, params={}):
-        if symbol is None:
-            raise ArgumentsRequired(self.id + ' fetchMyTrades requires a symbol argument')
         self.load_markets()
-        market = self.market(symbol)
         request = {
-            'currencyPair': market['id'],
-            # orderDesc': 'true',  # or 'false', if True then new orders will be first, otherwise old orders will be first.
+            # 'currencyPair': market['id'],
+            # 'orderDesc': 'true',  # or 'false', if True then new orders will be first, otherwise old orders will be first.
             # 'offset': 0,  # page offset, position of the first item on the page
         }
+        market = None
+        if symbol is not None:
+            market = self.market(symbol)
+            request['currencyPair'] = market['id']
         if limit is not None:
             request['limit'] = limit
         response = self.privateGetExchangeTrades(self.extend(request, params))
@@ -534,12 +564,8 @@ class livecoin(Exchange):
         # trades = self.parse_trades(order['trades'], market, since, limit)
         trades = None
         status = self.parse_order_status(self.safe_string_2(order, 'status', 'orderStatus'))
-        symbol = None
-        if market is None:
-            marketId = self.safe_string(order, 'currencyPair')
-            marketId = self.safe_string(order, 'symbol', marketId)
-            if marketId in self.markets_by_id:
-                market = self.markets_by_id[marketId]
+        marketId = self.safe_string_2(order, 'symbol', 'currencyPair')
+        symbol = self.safe_symbol(marketId, market, '/')
         type = self.safe_string_lower(order, 'type')
         side = None
         if type is not None:
@@ -561,13 +587,15 @@ class livecoin(Exchange):
         feeCost = None
         if cost is not None and feeRate is not None:
             feeCost = cost * feeRate
+        if (market is None) and (symbol in self.markets):
+            market = self.markets[symbol]
         feeCurrency = None
         if market is not None:
-            symbol = market['symbol']
             feeCurrency = market['quote']
         return {
             'info': order,
             'id': order['id'],
+            'clientOrderId': None,
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
             'lastTradeTimestamp': None,
@@ -586,6 +614,7 @@ class livecoin(Exchange):
                 'currency': feeCurrency,
                 'rate': feeRate,
             },
+            'average': None,
         }
 
     def fetch_orders(self, symbol=None, since=None, limit=None, params={}):
@@ -819,20 +848,14 @@ class livecoin(Exchange):
             return  # fallback to default error handler
         if code >= 300:
             feedback = self.id + ' ' + body
-            exact = self.exceptions['exact']
             errorCode = self.safe_string(response, 'errorCode')
-            if errorCode in exact:
-                raise exact[errorCode](feedback)
-            else:
-                raise ExchangeError(feedback)
+            self.throw_exactly_matched_exception(self.exceptions['exact'], errorCode, feedback)
+            raise ExchangeError(feedback)
         # returns status code 200 even if success == False
         success = self.safe_value(response, 'success', True)
         if not success:
             feedback = self.id + ' ' + body
-            broad = self.exceptions['broad']
             message = self.safe_string_2(response, 'message', 'exception')
             if message is not None:
-                broadKey = self.findBroadlyMatchedKey(broad, message)
-                if broadKey is not None:
-                    raise broad[broadKey](feedback)
+                self.throw_broadly_matched_exception(self.exceptions['broad'], message, feedback)
             raise ExchangeError(feedback)
